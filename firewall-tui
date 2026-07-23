@@ -1,0 +1,968 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+APP_NAME="Firewall TUI"
+VERSION="2.0.1"
+NFT_FAMILY="inet"
+NFT_TABLE="firewall_tui"
+NFT_CHAIN="input"
+STATE_DIR="/var/lib/firewall-tui"
+BACKUP_DIR="$STATE_DIR/backups"
+CONFIG_FILE="/etc/firewall-tui.conf"
+GENERATED_RULESET="/etc/firewall-tui.nft"
+RSYSLOG_FILE="/etc/rsyslog.d/30-firewall-tui.conf"
+FILE_LOG="/var/log/firewall-tui.log"
+SERVICE_FILE="/etc/systemd/system/firewall-tui.service"
+INSTALL_PATH="/usr/local/sbin/firewall-tui"
+
+# Valores padrão. INTERFACE="auto" usa a interface da rota padrão.
+INTERFACE="auto"
+TCP_PORTS=""
+UDP_PORTS=""
+SYN_RATE="20/second"
+SYN_BURST="40"
+ICMP_RATE="5/second"
+ICMP_BURST="10"
+LOG_DROPS="yes"
+ALLOW_DHCP="yes"
+
+LAST_BACKUP=""
+
+cleanup_error() {
+    local line="$1"
+    printf '\nErro na linha %s. A operação foi interrompida.\n' "$line" >&2
+}
+trap 'cleanup_error "$LINENO"' ERR
+
+msg() {
+    printf '%s\n' "$*"
+}
+
+pause() {
+    read -r -p "Pressione Enter para continuar..." _
+}
+
+require_root() {
+    if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+        printf 'Execute como root: sudo %s\n' "$0" >&2
+        exit 1
+    fi
+}
+
+require_commands() {
+    local missing=()
+    local cmd
+
+    for cmd in ip nft awk grep sed sort paste journalctl mktemp install date; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+
+    if ((${#missing[@]} > 0)); then
+        printf 'Comandos ausentes: %s\n' "${missing[*]}" >&2
+        printf 'No Debian, Ubuntu ou Xubuntu, instale com:\n' >&2
+        printf '  sudo apt update && sudo apt install nftables iproute2\n' >&2
+        exit 1
+    fi
+}
+
+detect_interface() {
+    ip -o route show to default 2>/dev/null | awk '{print $5; exit}'
+}
+
+valid_interface_name() {
+    [[ "$1" =~ ^[[:alnum:]_.:-]+$ ]]
+}
+
+valid_interface() {
+    [[ -n "$1" ]] && valid_interface_name "$1" && ip link show dev "$1" >/dev/null 2>&1
+}
+
+get_effective_interface() {
+    local selected="${INTERFACE:-auto}"
+
+    if [[ "$selected" == "auto" ]]; then
+        selected="$(detect_interface || true)"
+    fi
+
+    valid_interface "$selected" || return 1
+    printf '%s\n' "$selected"
+}
+
+valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
+valid_yes_no() {
+    [[ "$1" == "yes" || "$1" == "no" ]]
+}
+
+valid_rate() {
+    [[ "$1" =~ ^[1-9][0-9]*/(second|minute|hour|day)$ ]]
+}
+
+valid_positive_integer() {
+    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+normalize_ports() {
+    local ports="$1"
+    local p
+    local cleaned=()
+
+    for p in $ports; do
+        valid_port "$p" || continue
+        cleaned+=("$((10#$p))")
+    done
+
+    if ((${#cleaned[@]} == 0)); then
+        printf ''
+        return
+    fi
+
+    printf '%s\n' "${cleaned[@]}" | sort -n -u | paste -sd' ' -
+}
+
+port_in_list() {
+    local wanted="$1"
+    local p
+    shift
+
+    for p in "$@"; do
+        [[ "$p" == "$wanted" ]] && return 0
+    done
+    return 1
+}
+
+migrate_old_config_values() {
+    # Compatibilidade com a configuração da versão 1.x baseada em iptables.
+    if [[ -n "${ICMP_LIMIT:-}" && "$ICMP_RATE" == "5/second" ]] && valid_rate "$ICMP_LIMIT"; then
+        ICMP_RATE="$ICMP_LIMIT"
+    fi
+
+    if [[ -n "${SCAN_HITCOUNT:-}" && -n "${SCAN_SECONDS:-}" ]] \
+        && [[ "$SCAN_HITCOUNT" =~ ^[1-9][0-9]*$ ]] \
+        && [[ "$SCAN_SECONDS" =~ ^[1-9][0-9]*$ ]] \
+        && [[ "$SYN_RATE" == "20/second" ]]; then
+        local rate=$(((10#$SCAN_HITCOUNT + 10#$SCAN_SECONDS - 1) / 10#$SCAN_SECONDS))
+        ((rate < 1)) && rate=1
+        SYN_RATE="${rate}/second"
+        SYN_BURST="$SCAN_HITCOUNT"
+    fi
+}
+
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # Este arquivo é criado pelo programa com proprietário root e modo 600.
+        # shellcheck disable=SC1090
+        source "$CONFIG_FILE"
+    fi
+
+    migrate_old_config_values
+
+    TCP_PORTS="$(normalize_ports "${TCP_PORTS:-}")"
+    UDP_PORTS="$(normalize_ports "${UDP_PORTS:-}")"
+
+    [[ "${INTERFACE:-auto}" == "auto" ]] || valid_interface_name "$INTERFACE" || INTERFACE="auto"
+    valid_rate "${SYN_RATE:-}" || SYN_RATE="20/second"
+    valid_positive_integer "${SYN_BURST:-}" || SYN_BURST="40"
+    valid_rate "${ICMP_RATE:-}" || ICMP_RATE="5/second"
+    valid_positive_integer "${ICMP_BURST:-}" || ICMP_BURST="10"
+    valid_yes_no "${LOG_DROPS:-}" || LOG_DROPS="yes"
+    valid_yes_no "${ALLOW_DHCP:-}" || ALLOW_DHCP="yes"
+}
+
+save_config() {
+    install -d -m 700 "$STATE_DIR" "$BACKUP_DIR"
+    umask 077
+
+    cat > "$CONFIG_FILE" <<EOF_CONFIG
+# Firewall TUI $VERSION
+# Arquivo gerenciado pelo aplicativo.
+INTERFACE="$INTERFACE"
+TCP_PORTS="$TCP_PORTS"
+UDP_PORTS="$UDP_PORTS"
+SYN_RATE="$SYN_RATE"
+SYN_BURST="$SYN_BURST"
+ICMP_RATE="$ICMP_RATE"
+ICMP_BURST="$ICMP_BURST"
+LOG_DROPS="$LOG_DROPS"
+ALLOW_DHCP="$ALLOW_DHCP"
+EOF_CONFIG
+
+    chmod 600 "$CONFIG_FILE"
+}
+
+check_conflicting_firewalls() {
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+        printf 'UFW está ativo. Não use dois gerenciadores de firewall ao mesmo tempo.\n' >&2
+        printf 'Desative-o primeiro com: sudo ufw disable\n' >&2
+        return 1
+    fi
+
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        printf 'firewalld está ativo. Desative-o antes de usar o Firewall TUI.\n' >&2
+        return 1
+    fi
+
+    if command -v systemctl >/dev/null 2>&1 \
+        && systemctl is-active --quiet nftables.service 2>/dev/null \
+        && [[ -f /etc/nftables.conf ]] \
+        && grep -Eq '^[[:space:]]*flush[[:space:]]+ruleset' /etc/nftables.conf; then
+        printf 'Aviso: nftables.service está ativo e /etc/nftables.conf contém "flush ruleset".\n' >&2
+        printf 'Um reload desse serviço poderá remover temporariamente a tabela do Firewall TUI.\n' >&2
+    fi
+}
+
+nft_table_exists() {
+    nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1
+}
+
+legacy_chain_exists() {
+    command -v iptables >/dev/null 2>&1 \
+        && iptables -w -nL FWTUI_INPUT >/dev/null 2>&1
+}
+
+cleanup_legacy_iptables() {
+    command -v iptables >/dev/null 2>&1 || return 0
+
+    while iptables -w -C INPUT -j FWTUI_INPUT >/dev/null 2>&1; do
+        iptables -w -D INPUT -j FWTUI_INPUT
+    done
+
+    if legacy_chain_exists; then
+        iptables -w -F FWTUI_INPUT || true
+        iptables -w -X FWTUI_INPUT || true
+        printf 'A cadeia antiga FWTUI_INPUT do iptables foi removida.\n'
+    fi
+}
+
+format_nft_elements() {
+    local values="$1"
+    if [[ -z "$values" ]]; then
+        printf ''
+    else
+        printf '%s' "$values" | sed 's/[[:space:]]\+/, /g'
+    fi
+}
+
+write_set_block() {
+    local name="$1"
+    local values="$2"
+    local formatted
+    formatted="$(format_nft_elements "$values")"
+
+    cat <<EOF_SET
+    set $name {
+        type inet_service
+EOF_SET
+
+    if [[ -n "$formatted" ]]; then
+        printf '        elements = { %s }\n' "$formatted"
+    fi
+
+    cat <<'EOF_SET_END'
+    }
+EOF_SET_END
+}
+
+write_ruleset_body() {
+    local iface="$1"
+    local target="$2"
+
+    {
+        printf '#!/usr/sbin/nft -f\n\n'
+        printf '# Gerado pelo Firewall TUI %s.\n' "$VERSION"
+        printf '# Administra somente a tabela inet %s.\n\n' "$NFT_TABLE"
+        printf 'table %s %s {\n' "$NFT_FAMILY" "$NFT_TABLE"
+        write_set_block "allowed_tcp_ports" "$TCP_PORTS"
+        write_set_block "allowed_udp_ports" "$UDP_PORTS"
+
+        cat <<EOF_RULES
+
+    chain $NFT_CHAIN {
+        type filter hook input priority 0; policy accept;
+
+        # Tráfego local e conexões já conhecidas.
+        iifname "lo" counter accept
+        ct state { established, related } counter accept
+
+        # Pacotes inválidos recebidos pela interface protegida.
+        iifname "$iface" ct state invalid limit rate 6/minute burst 10 packets log prefix "FWTUI INVALID: " level warning
+        iifname "$iface" ct state invalid counter drop
+EOF_RULES
+
+        if [[ "$ALLOW_DHCP" == "yes" ]]; then
+            cat <<EOF_DHCP
+
+        # Respostas DHCP para clientes IPv4 e IPv6.
+        iifname "$iface" udp sport 67 udp dport 68 counter accept
+        iifname "$iface" udp sport 547 udp dport 546 counter accept
+EOF_DHCP
+        fi
+
+        cat <<EOF_RULES
+
+        # Combinações anormais de flags TCP frequentemente usadas em sondagens.
+        iifname "$iface" tcp flags & (fin | syn | rst | psh | ack | urg) == 0 limit rate 6/minute burst 10 packets log prefix "FWTUI TCP-NULL: " level warning
+        iifname "$iface" tcp flags & (fin | syn | rst | psh | ack | urg) == 0 counter drop
+
+        iifname "$iface" tcp flags & (fin | syn | rst | psh | ack | urg) == fin | psh | urg limit rate 6/minute burst 10 packets log prefix "FWTUI TCP-XMAS: " level warning
+        iifname "$iface" tcp flags & (fin | syn | rst | psh | ack | urg) == fin | psh | urg counter drop
+
+        iifname "$iface" tcp flags & (syn | fin) == syn | fin limit rate 6/minute burst 10 packets log prefix "FWTUI SYN-FIN: " level warning
+        iifname "$iface" tcp flags & (syn | fin) == syn | fin counter drop
+
+        # Heurística por IP para rajadas de novos SYN. Não confundir com IDS completo.
+        iifname "$iface" ip protocol tcp ct state new tcp flags & (syn | ack) == syn meter syn_rate_v4 { ip saddr timeout 1m limit rate over $SYN_RATE burst $SYN_BURST packets } limit rate 6/minute burst 10 packets log prefix "FWTUI SYN-RATE4: " level warning
+        iifname "$iface" ip protocol tcp ct state new tcp flags & (syn | ack) == syn meter syn_drop_v4 { ip saddr timeout 1m limit rate over $SYN_RATE burst $SYN_BURST packets } counter drop
+
+        iifname "$iface" meta nfproto ipv6 meta l4proto tcp ct state new tcp flags & (syn | ack) == syn meter syn_rate_v6 { ip6 saddr timeout 1m limit rate over $SYN_RATE burst $SYN_BURST packets } limit rate 6/minute burst 10 packets log prefix "FWTUI SYN-RATE6: " level warning
+        iifname "$iface" meta nfproto ipv6 meta l4proto tcp ct state new tcp flags & (syn | ack) == syn meter syn_drop_v6 { ip6 saddr timeout 1m limit rate over $SYN_RATE burst $SYN_BURST packets } counter drop
+
+        # Ping IPv4 limitado; outros tipos ICMP IPv4 permanecem disponíveis.
+        iifname "$iface" ip protocol icmp icmp type echo-request limit rate $ICMP_RATE burst $ICMP_BURST packets counter accept
+        iifname "$iface" ip protocol icmp icmp type echo-request limit rate 6/minute burst 10 packets log prefix "FWTUI ICMP4-RATE: " level warning
+        iifname "$iface" ip protocol icmp icmp type echo-request counter drop
+        iifname "$iface" ip protocol icmp counter accept
+
+        # ICMPv6 é necessário para descoberta de vizinhos, MTU e funcionamento do IPv6.
+        iifname "$iface" meta l4proto ipv6-icmp icmpv6 type echo-request limit rate $ICMP_RATE burst $ICMP_BURST packets counter accept
+        iifname "$iface" meta l4proto ipv6-icmp icmpv6 type echo-request limit rate 6/minute burst 10 packets log prefix "FWTUI ICMP6-RATE: " level warning
+        iifname "$iface" meta l4proto ipv6-icmp icmpv6 type echo-request counter drop
+        iifname "$iface" meta l4proto ipv6-icmp counter accept
+
+        # Serviços publicados pelo computador.
+        iifname "$iface" tcp dport @allowed_tcp_ports ct state new counter accept
+        iifname "$iface" udp dport @allowed_udp_ports counter accept
+EOF_RULES
+
+        if [[ "$LOG_DROPS" == "yes" ]]; then
+            cat <<EOF_LOG
+
+        iifname "$iface" limit rate 6/minute burst 10 packets log prefix "FWTUI DROP: " level warning
+EOF_LOG
+        fi
+
+        cat <<EOF_END
+        iifname "$iface" counter drop
+    }
+}
+EOF_END
+    } > "$target"
+
+    chmod 600 "$target"
+}
+
+backup_rules() {
+    local timestamp backup config_backup
+
+    if ! nft_table_exists; then
+        printf 'O firewall está inativo; não há tabela própria para salvar.\n' >&2
+        return 1
+    fi
+
+    install -d -m 700 "$BACKUP_DIR"
+    timestamp="$(date +%Y%m%d-%H%M%S-%N)"
+    backup="$BACKUP_DIR/firewall-tui-$timestamp.nft"
+    config_backup="$BACKUP_DIR/firewall-tui-$timestamp.conf"
+
+    nft list table "$NFT_FAMILY" "$NFT_TABLE" > "$backup"
+    chmod 600 "$backup"
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        cp -a "$CONFIG_FILE" "$config_backup"
+    else
+        save_config
+        cp -a "$CONFIG_FILE" "$config_backup"
+    fi
+    chmod 600 "$config_backup"
+
+    LAST_BACKUP="$backup"
+    printf '%s\n' "$backup"
+}
+
+backup_if_active() {
+    LAST_BACKUP=""
+    if nft_table_exists; then
+        backup_rules >/dev/null
+    fi
+}
+
+ensure_placeholder_table() {
+    if ! nft_table_exists; then
+        nft add table "$NFT_FAMILY" "$NFT_TABLE"
+        return 0
+    fi
+    return 1
+}
+
+apply_rules() {
+    local iface body transaction placeholder_created="no"
+
+    check_conflicting_firewalls
+
+    iface="$(get_effective_interface)" || {
+        printf 'Não foi possível detectar uma interface de rede válida.\n' >&2
+        printf 'Escolha uma interface no menu ou defina INTERFACE em %s.\n' "$CONFIG_FILE" >&2
+        return 1
+    }
+
+    cleanup_legacy_iptables
+    backup_if_active
+    save_config
+
+    body="$(mktemp /run/firewall-tui-body.XXXXXX.nft)"
+    transaction="$(mktemp /run/firewall-tui-transaction.XXXXXX.nft)"
+
+    if ensure_placeholder_table; then
+        placeholder_created="yes"
+    fi
+
+    write_ruleset_body "$iface" "$body"
+    {
+        printf 'delete table %s %s\n' "$NFT_FAMILY" "$NFT_TABLE"
+        sed '1{/^#!\/usr\/sbin\/nft -f$/d;}' "$body"
+    } > "$transaction"
+
+    if ! nft -c -f "$transaction"; then
+        [[ "$placeholder_created" == "yes" ]] && nft delete table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1 || true
+        rm -f "$body" "$transaction"
+        printf 'A sintaxe nftables não foi aceita; nenhuma regra nova foi aplicada.\n' >&2
+        return 1
+    fi
+
+    nft -f "$transaction"
+    install -m 600 "$body" "$GENERATED_RULESET"
+    rm -f "$body" "$transaction"
+
+    printf 'Firewall ativado com nftables na interface %s.\n' "$iface"
+    printf 'Tabela administrada: %s %s\n' "$NFT_FAMILY" "$NFT_TABLE"
+    [[ -n "$LAST_BACKUP" ]] && printf 'Backup anterior: %s\n' "$LAST_BACKUP"
+    return 0
+}
+
+stop_firewall() {
+    cleanup_legacy_iptables
+
+    if nft_table_exists; then
+        backup_rules >/dev/null
+        nft delete table "$NFT_FAMILY" "$NFT_TABLE"
+        printf 'Firewall TUI desativado. Backup: %s\n' "$LAST_BACKUP"
+    else
+        printf 'Firewall TUI já está inativo.\n'
+    fi
+
+    printf 'As demais tabelas nftables do sistema foram preservadas.\n'
+}
+
+restart_firewall() {
+    apply_rules
+}
+
+firewall_active() {
+    nft_table_exists
+}
+
+show_status() {
+    local iface="não detectada"
+    iface="$(get_effective_interface 2>/dev/null || true)"
+    [[ -n "$iface" ]] || iface="não detectada"
+
+    printf '\n%s %s\n' "$APP_NAME" "$VERSION"
+    printf 'Backend: nftables (%s)\n' "$(nft --version 2>/dev/null || printf 'versão desconhecida')"
+    printf 'Interface configurada: %s\n' "$INTERFACE"
+    printf 'Interface efetiva: %s\n' "$iface"
+    printf 'Portas TCP permitidas: %s\n' "${TCP_PORTS:-nenhuma}"
+    printf 'Portas UDP permitidas: %s\n' "${UDP_PORTS:-nenhuma}"
+    printf 'Limite de novos SYN por IP: %s, burst %s\n' "$SYN_RATE" "$SYN_BURST"
+    printf 'Limite de ping: %s, burst %s\n' "$ICMP_RATE" "$ICMP_BURST"
+    printf 'DHCP cliente: %s | Log de descartes: %s\n' "$ALLOW_DHCP" "$LOG_DROPS"
+
+    if firewall_active; then
+        printf 'Estado: ATIVO\n\n'
+        nft -a list table "$NFT_FAMILY" "$NFT_TABLE"
+    else
+        printf 'Estado: INATIVO\n'
+    fi
+
+    if command -v systemctl >/dev/null 2>&1 && [[ -f "$SERVICE_FILE" ]]; then
+        printf '\nInicialização automática: '
+        if systemctl is-enabled --quiet firewall-tui.service 2>/dev/null; then
+            printf 'ATIVADA\n'
+        else
+            printf 'DESATIVADA\n'
+        fi
+    fi
+}
+
+reapply_if_active() {
+    if firewall_active; then
+        printf 'Reaplicando a configuração ativa...\n'
+        apply_rules
+    else
+        printf 'Configuração salva. Ative o firewall para aplicá-la.\n'
+    fi
+}
+
+add_port() {
+    local proto="$1" port
+
+    read -r -p "Porta $proto a permitir (1-65535): " port
+    if ! valid_port "$port"; then
+        printf 'Porta inválida.\n'
+        return 1
+    fi
+
+    port="$((10#$port))"
+    if [[ "$proto" == "TCP" ]]; then
+        TCP_PORTS="$(normalize_ports "$TCP_PORTS $port")"
+    else
+        UDP_PORTS="$(normalize_ports "$UDP_PORTS $port")"
+    fi
+
+    save_config
+    printf 'Porta %s/%s adicionada.\n' "$port" "${proto,,}"
+    reapply_if_active
+}
+
+remove_port() {
+    local proto port current p result="" ssh_port=""
+
+    read -r -p "Protocolo (tcp/udp): " proto
+    proto="${proto,,}"
+    [[ "$proto" == "tcp" || "$proto" == "udp" ]] || {
+        printf 'Protocolo inválido.\n'
+        return 1
+    }
+
+    read -r -p "Porta a remover: " port
+    valid_port "$port" || {
+        printf 'Porta inválida.\n'
+        return 1
+    }
+    port="$((10#$port))"
+
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        ssh_port="$(awk '{print $4}' <<< "$SSH_CONNECTION")"
+    fi
+
+    if [[ "$proto" == "tcp" && -n "$ssh_port" && "$port" == "$ssh_port" ]]; then
+        printf 'A porta %s é usada pela sessão SSH atual e não será removida.\n' "$port" >&2
+        return 1
+    fi
+
+    if [[ "$proto" == "tcp" ]]; then
+        current="$TCP_PORTS"
+    else
+        current="$UDP_PORTS"
+    fi
+
+    for p in $current; do
+        [[ "$p" == "$port" ]] || result+=" $p"
+    done
+    result="${result# }"
+
+    if [[ "$proto" == "tcp" ]]; then
+        TCP_PORTS="$result"
+    else
+        UDP_PORTS="$result"
+    fi
+
+    save_config
+    printf 'Porta %s/%s removida.\n' "$port" "$proto"
+    reapply_if_active
+}
+
+choose_interface() {
+    local selected
+
+    printf 'Interfaces disponíveis:\n'
+    printf '  - auto (interface da rota padrão)\n'
+    ip -br link show | awk '{print "  - " $1}'
+    read -r -p "Interface: " selected
+
+    if [[ "$selected" != "auto" ]] && ! valid_interface "$selected"; then
+        printf 'Interface inválida.\n'
+        return 1
+    fi
+
+    INTERFACE="$selected"
+    save_config
+    printf 'Interface alterada para %s.\n' "$INTERFACE"
+    reapply_if_active
+}
+
+configure_protection() {
+    local value
+
+    printf 'Valor atual para novos SYN por IP: %s (burst %s)\n' "$SYN_RATE" "$SYN_BURST"
+    read -r -p "Nova taxa, exemplo 20/second [Enter mantém]: " value
+    if [[ -n "$value" ]]; then
+        valid_rate "$value" || {
+            printf 'Taxa inválida. Use número/(second|minute|hour|day).\n'
+            return 1
+        }
+        SYN_RATE="$value"
+    fi
+
+    read -r -p "Novo burst SYN [Enter mantém $SYN_BURST]: " value
+    if [[ -n "$value" ]]; then
+        valid_positive_integer "$value" || {
+            printf 'Burst inválido.\n'
+            return 1
+        }
+        SYN_BURST="$value"
+    fi
+
+    printf 'Valor atual de ping: %s (burst %s)\n' "$ICMP_RATE" "$ICMP_BURST"
+    read -r -p "Nova taxa de ping [Enter mantém]: " value
+    if [[ -n "$value" ]]; then
+        valid_rate "$value" || {
+            printf 'Taxa inválida.\n'
+            return 1
+        }
+        ICMP_RATE="$value"
+    fi
+
+    read -r -p "Novo burst de ping [Enter mantém $ICMP_BURST]: " value
+    if [[ -n "$value" ]]; then
+        valid_positive_integer "$value" || {
+            printf 'Burst inválido.\n'
+            return 1
+        }
+        ICMP_BURST="$value"
+    fi
+
+    read -r -p "Registrar descartes finais? (yes/no) [atual: $LOG_DROPS]: " value
+    if [[ -n "$value" ]]; then
+        valid_yes_no "$value" || {
+            printf 'Use yes ou no.\n'
+            return 1
+        }
+        LOG_DROPS="$value"
+    fi
+
+    read -r -p "Permitir respostas DHCP? (yes/no) [atual: $ALLOW_DHCP]: " value
+    if [[ -n "$value" ]]; then
+        valid_yes_no "$value" || {
+            printf 'Use yes ou no.\n'
+            return 1
+        }
+        ALLOW_DHCP="$value"
+    fi
+
+    save_config
+    reapply_if_active
+}
+
+show_logs() {
+    if [[ -f "$FILE_LOG" ]]; then
+        if command -v less >/dev/null 2>&1; then
+            less +G "$FILE_LOG"
+        else
+            tail -n 100 "$FILE_LOG"
+        fi
+    else
+        journalctl -k --no-pager -g 'FWTUI' -n 100 || true
+        printf '\nTempo real: sudo journalctl -kf -g FWTUI\n'
+    fi
+}
+
+follow_logs() {
+    if [[ -f "$FILE_LOG" ]]; then
+        tail -f "$FILE_LOG"
+    else
+        journalctl -kf -g 'FWTUI'
+    fi
+}
+
+configure_rsyslog() {
+    if ! command -v rsyslogd >/dev/null 2>&1; then
+        printf 'rsyslog não está instalado. Use journalctl -kf -g FWTUI.\n'
+        return 1
+    fi
+
+    cat > "$RSYSLOG_FILE" <<'EOF_RSYSLOG'
+if ($msg contains "FWTUI") then {
+    action(type="omfile" file="/var/log/firewall-tui.log")
+    stop
+}
+EOF_RSYSLOG
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl restart rsyslog.service
+    else
+        service rsyslog restart
+    fi
+
+    touch "$FILE_LOG"
+    chmod 640 "$FILE_LOG"
+    printf 'Logs configurados em %s\n' "$FILE_LOG"
+}
+
+list_backups() {
+    local backups=("$BACKUP_DIR"/firewall-tui-*.nft)
+    local i=1 file
+
+    if [[ ! -e "${backups[0]}" ]]; then
+        printf 'Nenhum backup encontrado.\n'
+        return 1
+    fi
+
+    for file in "${backups[@]}"; do
+        printf '%2d) %s\n' "$i" "$file"
+        ((i += 1))
+    done
+}
+
+restore_backup() {
+    local backups=("$BACKUP_DIR"/firewall-tui-*.nft)
+    local choice backup config_backup transaction placeholder_created="no"
+
+    list_backups || return 1
+    read -r -p "Número do backup: " choice
+
+    [[ "$choice" =~ ^[1-9][0-9]*$ ]] || {
+        printf 'Seleção inválida.\n'
+        return 1
+    }
+    ((choice <= ${#backups[@]})) || {
+        printf 'Seleção inválida.\n'
+        return 1
+    }
+
+    backup="${backups[choice-1]}"
+    config_backup="${backup%.nft}.conf"
+    transaction="$(mktemp /run/firewall-tui-restore.XXXXXX.nft)"
+
+    backup_if_active
+    if ensure_placeholder_table; then
+        placeholder_created="yes"
+    fi
+
+    {
+        printf 'delete table %s %s\n' "$NFT_FAMILY" "$NFT_TABLE"
+        cat "$backup"
+    } > "$transaction"
+
+    if ! nft -c -f "$transaction"; then
+        [[ "$placeholder_created" == "yes" ]] && nft delete table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1 || true
+        rm -f "$transaction"
+        printf 'O backup não contém uma configuração nftables válida.\n' >&2
+        return 1
+    fi
+
+    nft -f "$transaction"
+    rm -f "$transaction"
+
+    if [[ -f "$config_backup" ]]; then
+        install -m 600 "$config_backup" "$CONFIG_FILE"
+        load_config
+    fi
+
+    printf 'Regras restauradas de %s\n' "$backup"
+    [[ -n "$LAST_BACKUP" ]] && printf 'Estado anterior salvo em %s\n' "$LAST_BACKUP"
+    return 0
+}
+
+write_service_unit() {
+    cat > "$SERVICE_FILE" <<'EOF_SERVICE'
+[Unit]
+Description=Firewall TUI - regras nftables IPv4 e IPv6
+Documentation=man:nft(8)
+Wants=network-online.target
+After=network-online.target nftables.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/firewall-tui start
+ExecReload=/usr/local/sbin/firewall-tui restart
+ExecStop=/usr/local/sbin/firewall-tui stop
+RemainAfterExit=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+    chmod 644 "$SERVICE_FILE"
+}
+
+install_service() {
+    local current
+
+    command -v systemctl >/dev/null 2>&1 || {
+        printf 'systemd não foi encontrado.\n' >&2
+        return 1
+    }
+
+    current="$(readlink -f "$0")"
+    if [[ "$current" != "$INSTALL_PATH" ]]; then
+        install -m 750 "$current" "$INSTALL_PATH"
+    else
+        chmod 750 "$INSTALL_PATH"
+    fi
+
+    write_service_unit
+    save_config
+    systemctl daemon-reload
+    systemctl enable firewall-tui.service
+
+    if ! firewall_active; then
+        confirm_remote_warning || {
+            printf 'Serviço instalado, mas o firewall não foi iniciado.\n'
+            return 0
+        }
+        apply_rules
+    fi
+
+    systemctl restart firewall-tui.service
+    printf 'Serviço instalado e habilitado para iniciar com o sistema.\n'
+}
+
+disable_service() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+
+    if [[ -f "$SERVICE_FILE" ]]; then
+        systemctl disable firewall-tui.service || true
+        printf 'Inicialização automática desativada. As regras atualmente carregadas foram preservadas.\n'
+    else
+        printf 'O serviço não está instalado.\n'
+    fi
+}
+
+show_help() {
+    cat <<EOF_HELP
+Uso: sudo $0 [comando]
+
+Comandos:
+  menu              abre o menu interativo
+  start             valida e aplica as regras nftables
+  stop              remove somente a tabela inet $NFT_TABLE
+  restart           reaplica as regras
+  status            mostra estado, regras, handles e contadores
+  logs              mostra os últimos logs
+  follow            acompanha os logs em tempo real
+  backup            salva a tabela e a configuração do Firewall TUI
+  restore           restaura um backup selecionado
+  install-service   instala o comando e habilita o serviço systemd
+  disable-service   remove a inicialização automática
+  help              mostra esta ajuda
+
+Arquivos:
+  configuração:     $CONFIG_FILE
+  regras geradas:   $GENERATED_RULESET
+  backups:          $BACKUP_DIR
+  log opcional:     $FILE_LOG
+EOF_HELP
+}
+
+confirm_remote_warning() {
+    local ssh_port=""
+    local tcp_array=()
+
+    if [[ -z "${SSH_CONNECTION:-}" ]]; then
+        return 0
+    fi
+
+    ssh_port="$(awk '{print $4}' <<< "$SSH_CONNECTION")"
+    read -r -a tcp_array <<< "$TCP_PORTS"
+
+    if valid_port "$ssh_port" && port_in_list "$ssh_port" "${tcp_array[@]}"; then
+        return 0
+    fi
+
+    printf '\nATENÇÃO: você está conectado por SSH na porta %s.\n' "${ssh_port:-desconhecida}"
+    printf 'Essa porta não aparece na lista TCP permitida. A conexão pode ser interrompida.\n'
+    read -r -p "Continuar mesmo assim? [s/N]: " answer
+    [[ "$answer" =~ ^[sS]$ ]]
+}
+
+menu_loop() {
+    local option effective=""
+
+    while true; do
+        effective="$(get_effective_interface 2>/dev/null || true)"
+        clear
+        cat <<EOF_MENU
+==================================================
+ $APP_NAME $VERSION — nftables IPv4/IPv6
+ Interface: $INTERFACE (efetiva: ${effective:-não detectada})
+ TCP: ${TCP_PORTS:-nenhuma} | UDP: ${UDP_PORTS:-nenhuma}
+==================================================
+1) Ativar firewall
+2) Desativar firewall
+3) Reiniciar firewall
+4) Ver status, regras e contadores
+5) Permitir porta TCP
+6) Permitir porta UDP
+7) Remover porta permitida
+8) Escolher interface
+9) Configurar limites e logs
+10) Ver últimos logs
+11) Acompanhar logs em tempo real
+12) Configurar arquivo de log com rsyslog
+13) Criar backup
+14) Restaurar backup
+15) Instalar/atualizar inicialização automática
+16) Remover inicialização automática
+0) Sair
+EOF_MENU
+        read -r -p "Escolha: " option
+
+        case "$option" in
+            1)
+                if confirm_remote_warning; then apply_rules; else printf 'Operação cancelada.\n'; fi
+                pause
+                ;;
+            2) stop_firewall; pause ;;
+            3)
+                if confirm_remote_warning; then restart_firewall; else printf 'Operação cancelada.\n'; fi
+                pause
+                ;;
+            4) show_status; pause ;;
+            5) add_port TCP || true; pause ;;
+            6) add_port UDP || true; pause ;;
+            7) remove_port || true; pause ;;
+            8) choose_interface || true; pause ;;
+            9) configure_protection || true; pause ;;
+            10) show_logs || true; pause ;;
+            11) follow_logs ;;
+            12) configure_rsyslog || true; pause ;;
+            13) backup_rules || true; pause ;;
+            14) restore_backup || true; pause ;;
+            15) install_service || true; pause ;;
+            16) disable_service || true; pause ;;
+            0) break ;;
+            *) printf 'Opção inválida.\n'; pause ;;
+        esac
+    done
+}
+
+main() {
+    require_root
+    require_commands
+    load_config
+
+    case "${1:-menu}" in
+        menu) menu_loop ;;
+        start)
+            if confirm_remote_warning; then apply_rules; else printf 'Operação cancelada.\n'; fi
+            ;;
+        stop) stop_firewall ;;
+        restart)
+            if confirm_remote_warning; then restart_firewall; else printf 'Operação cancelada.\n'; fi
+            ;;
+        status) show_status ;;
+        logs) show_logs ;;
+        follow) follow_logs ;;
+        backup) backup_rules ;;
+        restore) restore_backup ;;
+        install-service) install_service ;;
+        disable-service) disable_service ;;
+        help|-h|--help) show_help ;;
+        *) show_help; exit 2 ;;
+    esac
+}
+
+main "$@"

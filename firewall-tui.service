@@ -1,0 +1,16 @@
+[Unit]
+Description=Firewall TUI - regras nftables IPv4 e IPv6
+Documentation=man:nft(8)
+Wants=network-online.target
+After=network-online.target nftables.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/firewall-tui start
+ExecReload=/usr/local/sbin/firewall-tui restart
+ExecStop=/usr/local/sbin/firewall-tui stop
+RemainAfterExit=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
